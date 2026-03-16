@@ -11,7 +11,7 @@
         "APP_ENV": "development"
       },
       "ios": {
-        "simulator": true
+        "simulator": false
       },
       "android": {
         "buildType": "apk"

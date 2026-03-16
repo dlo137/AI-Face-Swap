@@ -17,7 +17,10 @@
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.yourcompany.aifaceswap",
-      "deploymentTarget": "15.1"
+      "deploymentTarget": "15.1",
+      "infoPlist": {
+        "ITSAppUsesNonExemptEncryption": false
+      }
     },
     "android": {
       "adaptiveIcon": {
@@ -45,6 +48,15 @@
     ],
     "experiments": {
       "typedRoutes": true
+    },
+    "extra": {
+      "router": {
+        "root": "src/app",
+        "origin": "https://yourapp.com"
+      },
+      "eas": {
+        "projectId": "3f9c4ae0-9ef8-42cc-ac8f-1b33fd6c4325"
+      }
     }
   }
 }
