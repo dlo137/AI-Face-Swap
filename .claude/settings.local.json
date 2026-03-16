@@ -6,7 +6,8 @@
       "Bash(nvm install:*)",
       "Bash(nvm use:*)",
       "Bash(where node:*)",
-      "Bash(find:*)"
+      "Bash(find:*)",
+      "Bash(curl:*)"
     ]
   }
 }

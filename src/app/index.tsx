@@ -1,3 +1,4 @@
+import * as ImageManipulator from 'expo-image-manipulator';
 import * as ImagePicker from 'expo-image-picker';
 import * as MediaLibrary from 'expo-media-library';
 import { useState } from 'react';
@@ -16,6 +17,8 @@ import { VideoView, useVideoPlayer } from 'expo-video';
 const SUPABASE_URL = process.env.EXPO_PUBLIC_SUPABASE_URL!;
 const SUPABASE_ANON_KEY = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY!;
 const PIAPI_KEY = process.env.EXPO_PUBLIC_PIAPI_KEY!;
+const CLOUDINARY_CLOUD_NAME = process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME!;
+const CLOUDINARY_UPLOAD_PRESET = process.env.EXPO_PUBLIC_CLOUDINARY_UPLOAD_PRESET!;
 const BUCKET_NAME = 'faceswap-uploads';
 const MAX_VIDEO_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -24,26 +27,79 @@ async function uploadToSupabase(
   fileName: string,
   mimeType: string,
 ): Promise<string> {
+  console.log(`[upload] fetching local file: ${fileUri}`);
   const response = await fetch(fileUri);
   const blob = await response.blob();
+  console.log(`[upload] blob size: ${blob.size} bytes, type: ${blob.type}`);
 
-  const res = await fetch(
-    `${SUPABASE_URL}/storage/v1/object/${BUCKET_NAME}/${fileName}`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': mimeType,
-      },
-      body: blob,
+  const uploadUrl = `${SUPABASE_URL}/storage/v1/object/${BUCKET_NAME}/${fileName}`;
+  console.log(`[upload] POSTing to: ${uploadUrl}`);
+
+  const res = await fetch(uploadUrl, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+      'Content-Type': mimeType,
     },
-  );
+    body: blob,
+  });
+
+  const resText = await res.text();
+  console.log(`[upload] response status: ${res.status}, body: ${resText}`);
 
   if (!res.ok) {
-    throw new Error(`Upload failed: ${res.status}`);
+    throw new Error(`Upload failed: ${res.status} — ${resText}`);
   }
 
-  return `${SUPABASE_URL}/storage/v1/object/public/${BUCKET_NAME}/${fileName}`;
+  const publicUrl = `${SUPABASE_URL}/storage/v1/object/public/${BUCKET_NAME}/${fileName}`;
+  console.log(`[upload] public URL: ${publicUrl}`);
+  return publicUrl;
+}
+
+async function resizeImageIfNeeded(uri: string): Promise<string> {
+  const result = await ImageManipulator.manipulateAsync(
+    uri,
+    [{ resize: { width: 1024 } }],
+    { compress: 0.85, format: ImageManipulator.SaveFormat.JPEG },
+  );
+  return result.uri;
+}
+
+async function waitForCloudinaryVideo(url: string, maxAttempts = 15): Promise<void> {
+  for (let i = 0; i < maxAttempts; i++) {
+    try {
+      const res = await fetch(url, { method: 'HEAD' });
+      console.log(`[cloudinary] transcode poll ${i + 1}: ${res.status}`);
+      if (res.ok) return;
+    } catch {}
+    await new Promise<void>((resolve) => setTimeout(resolve, 3000));
+  }
+  throw new Error('Cloudinary video took too long to process');
+}
+
+async function uploadVideoToCloudinary(fileUri: string): Promise<string> {
+  console.log('[cloudinary] cloud:', CLOUDINARY_CLOUD_NAME, 'preset:', CLOUDINARY_UPLOAD_PRESET);
+  const formData = new FormData();
+  // React Native blobs don't serialize in FormData — use the native file object format instead
+  formData.append('file', { uri: fileUri, type: 'video/mp4', name: 'upload.mp4' } as any);
+  formData.append('upload_preset', CLOUDINARY_UPLOAD_PRESET);
+  formData.append('resource_type', 'video');
+
+  const uploadUrl = `https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/video/upload`;
+  console.log('[cloudinary] POSTing to:', uploadUrl);
+
+  const res = await fetch(uploadUrl, { method: 'POST', body: formData });
+
+  const resText = await res.text();
+  console.log(`[cloudinary] response status: ${res.status}, body: ${resText}`);
+
+  if (!res.ok) throw new Error(`Cloudinary upload failed: ${res.status} — ${resText}`);
+
+  const data = JSON.parse(resText);
+  const publicId: string = data.public_id;
+  console.log('[cloudinary] public_id:', publicId);
+
+  return `https://res.cloudinary.com/${CLOUDINARY_CLOUD_NAME}/video/upload/f_mp4,vc_h264,w_720,h_1280,c_limit/${publicId}.mp4`;
 }
 
 function uniqueName(ext: string): string {
@@ -51,29 +107,43 @@ function uniqueName(ext: string): string {
 }
 
 async function submitFaceSwap(videoUrl: string, imageUrl: string): Promise<string> {
+  const body = {
+    model: 'Qubico/video-toolkit',
+    task_type: 'face-swap',
+    input: {
+      swap_image: imageUrl,
+      target_video: videoUrl,
+      swap_faces_index: '0',
+      target_faces_index: '0',
+    },
+  };
+  console.log('[piapi] submitting task, body:', JSON.stringify(body));
+  console.log('[piapi] key present:', Boolean(PIAPI_KEY), 'key prefix:', PIAPI_KEY?.slice(0, 8));
+
   const res = await fetch('https://api.piapi.ai/api/v1/task', {
     method: 'POST',
     headers: {
       'x-api-key': PIAPI_KEY,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      model: 'Qubico/video-toolkit',
-      task_type: 'face-swap',
-      input: {
-        swap_image: imageUrl,
-        target_video: videoUrl,
-        swap_faces_index: '0',
-        target_faces_index: '0',
-      },
-    }),
+    body: JSON.stringify(body),
   });
 
-  const data = await res.json();
+  const resText = await res.text();
+  console.log(`[piapi] submit response status: ${res.status}, body: ${resText}`);
+
+  let data: any;
+  try {
+    data = JSON.parse(resText);
+  } catch {
+    throw new Error(`PiAPI returned non-JSON: ${resText}`);
+  }
+
   const taskId: string | undefined = data?.data?.task_id;
   if (!taskId) {
-    throw new Error('No task_id returned from PiAPI');
+    throw new Error(`No task_id in response: ${resText}`);
   }
+  console.log('[piapi] task_id:', taskId);
   return taskId;
 }
 
@@ -81,26 +151,37 @@ async function pollForResult(
   taskId: string,
   onAttempt: (n: number) => void,
 ): Promise<string> {
-  const MAX_ATTEMPTS = 30;
+  const MAX_ATTEMPTS = 60;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     onAttempt(attempt);
     const res = await fetch(`https://api.piapi.ai/api/v1/task/${taskId}`, {
       headers: { 'x-api-key': PIAPI_KEY },
     });
-    const data = await res.json();
+    const resText = await res.text();
+    console.log(`[poll] attempt ${attempt}, status: ${res.status}, body: ${resText}`);
+
+    let data: any;
+    try {
+      data = JSON.parse(resText);
+    } catch {
+      throw new Error(`Poll returned non-JSON: ${resText}`);
+    }
+
     const status: string = data?.data?.status;
+    console.log(`[poll] task status: ${status}`);
 
     if (status === 'completed') {
       const videoUrl: string | undefined = data?.data?.output?.video_url;
-      if (!videoUrl) throw new Error('No video_url in completed response');
+      if (!videoUrl) throw new Error(`No video_url in completed response: ${resText}`);
+      console.log('[poll] result video URL:', videoUrl);
       return videoUrl;
     }
     if (status === 'failed') {
-      throw new Error('Face swap failed');
+      throw new Error(`Face swap failed. Full response: ${resText}`);
     }
 
     if (attempt < MAX_ATTEMPTS) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 4000));
+      await new Promise<void>((resolve) => setTimeout(resolve, 5000));
     }
   }
   throw new Error('Timed out waiting for face swap result');
@@ -115,7 +196,7 @@ export default function HomeScreen() {
   const [resultVideoUrl, setResultVideoUrl] = useState<string | null>(null);
   const [pollAttempt, setPollAttempt] = useState(0);
 
-  const player = useVideoPlayer(resultVideoUrl ?? '', (p) => {
+  const player = useVideoPlayer(resultVideoUrl, (p) => {
     p.loop = false;
   });
 
@@ -164,29 +245,29 @@ export default function HomeScreen() {
     setPollAttempt(0);
     setIsLoading(true);
     try {
-      setStatusMessage('Uploading video...');
-      const videoExt = targetVideo.uri.split('.').pop() ?? 'mp4';
-      const videoUrl = await uploadToSupabase(
-        targetVideo.uri,
-        uniqueName(videoExt),
-        targetVideo.mimeType ?? 'video/mp4',
-      );
+      setStatusMessage('Processing video...');
+      const videoUrl = await uploadVideoToCloudinary(targetVideo.uri);
+
+      setStatusMessage('Preparing video...');
+      await waitForCloudinaryVideo(videoUrl);
+
+      setStatusMessage('Resizing image...');
+      const resizedUri = await resizeImageIfNeeded(faceImage.uri);
 
       setStatusMessage('Uploading image...');
-      const imageExt = faceImage.uri.split('.').pop() ?? 'jpg';
       const imageUrl = await uploadToSupabase(
-        faceImage.uri,
-        uniqueName(imageExt),
-        faceImage.mimeType ?? 'image/jpeg',
+        resizedUri,
+        uniqueName('jpg'),
+        'image/jpeg',
       );
 
       setStatusMessage('Submitting to PiAPI...');
       const taskId = await submitFaceSwap(videoUrl, imageUrl);
 
-      setStatusMessage('Processing... (attempt 1)');
+      setStatusMessage('Processing face swap... (1/60)');
       const resultUrl = await pollForResult(taskId, (n) => {
         setPollAttempt(n);
-        setStatusMessage(`Processing... (attempt ${n})`);
+        setStatusMessage(`Processing face swap... (${n}/60)`);
       });
 
       setResultVideoUrl(resultUrl);
