@@ -1,0 +1,18 @@
+# Python deps — for reference only.
+# The actual install happens inside the Modal image definition in main.py.
+
+modal>=0.62.0
+torch==2.2.1
+torchvision==0.17.1
+insightface==0.7.3
+onnxruntime-gpu==1.17.1
+opencv-python-headless==4.9.0.80
+ffmpeg-python==0.2.0
+Pillow
+numpy
+scipy
+tqdm
+gfpgan
+basicsr
+facexlib
+supabase
