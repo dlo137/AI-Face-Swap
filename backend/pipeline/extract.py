@@ -4,6 +4,7 @@ extract.py — Frame extraction + audio strip using ffmpeg-python
 import os
 import glob
 import ffmpeg
+from pipeline.rebuild import write_fps
 
 
 def extract_frames(video_path: str, output_dir: str) -> tuple[list[str], str]:
@@ -47,6 +48,7 @@ def extract_frames(video_path: str, output_dir: str) -> tuple[list[str], str]:
     height = int(video_stream.get("height", 0))
 
     print(f"[extract] {width}x{height} @ {fps:.3f} fps | duration={duration:.1f}s")
+    write_fps(output_dir, fps)      # persist for rebuild_video()
 
     # ── Frames ─────────────────────────────────────────────────────────────────
     (

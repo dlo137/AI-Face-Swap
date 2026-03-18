@@ -146,8 +146,8 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
 
     from pipeline.extract import extract_frames
     from pipeline.detect import detect_face, extract_identity
-    from pipeline.swap import load_swapper, swap_faces_in_frames
-    from pipeline.restore import restore_frames
+    from pipeline.swap import load_models, swap_faces_in_frames
+    from pipeline.restore import load_codeformer, restore_frames
     from pipeline.rebuild import rebuild_video
     from storage import upload_video
 
@@ -175,9 +175,10 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
         print("[pipeline] extracting frames...")
         frame_paths, audio_path = extract_frames(tgt_vid_path, frames_dir)
 
-        # ── 3. Load swap model ─────────────────────────────────────────────────
-        print("[pipeline] loading HyperSwap model...")
-        swapper = load_swapper(WEIGHTS_DIR)
+        # ── 3. Load models ─────────────────────────────────────────────────────
+        print("[pipeline] loading HyperSwap + BiSeNet + CodeFormer...")
+        hyperswap_model, bisenet_model = load_models(WEIGHTS_DIR)
+        codeformer_net = load_codeformer(WEIGHTS_DIR)
 
         # ── 4. Extract source identity embedding (once per job) ────────────────
         print("[pipeline] extracting source identity...")
@@ -185,15 +186,22 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
 
         # ── 5. Swap faces in every frame ───────────────────────────────────────
         print("[pipeline] swapping faces...")
-        swap_faces_in_frames(swapper, identity_embedding, frame_paths, swapped_dir)
+        swap_faces_in_frames(
+            hyperswap_model, identity_embedding, frame_paths, swapped_dir,
+            bisenet_model=bisenet_model,
+        )
 
         # ── 6. Restore / enhance frames ────────────────────────────────────────
         print("[pipeline] restoring frames with CodeFormer...")
-        restore_frames(swapped_dir, restored_dir, WEIGHTS_DIR)
+        restore_frames(
+            swapped_dir, frames_dir, restored_dir,
+            bisenet_model=bisenet_model,
+            codeformer_net=codeformer_net,
+        )
 
         # ── 7. Reassemble video ────────────────────────────────────────────────
         print("[pipeline] rebuilding video...")
-        rebuild_video(restored_dir, audio_path, fps, output_path)
+        rebuild_video(restored_dir, audio_path, output_path)
 
         # ── 8. Upload to Supabase ──────────────────────────────────────────────
         print("[pipeline] uploading to Supabase...")

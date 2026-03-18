@@ -1,60 +1,100 @@
 """
 storage.py — Supabase Storage upload
-Uploads the output video and returns its public URL.
 
-Required env vars (set via Modal Secret "supabase-secret"):
-  SUPABASE_URL      — e.g. https://xxxx.supabase.co
-  SUPABASE_KEY      — service_role key (NOT anon — needs storage write access)
-  SUPABASE_BUCKET   — e.g. "face-swap-results"
+Public API:
+  upload_to_supabase(file_path, supabase_url, supabase_key, bucket) → str (public URL)
+  upload_video(file_path)                                            → str (reads env vars)
 """
+from __future__ import annotations
+
 import os
 import uuid
-from pathlib import Path
 
 
-def upload_video(local_path: str) -> str:
+def upload_to_supabase(
+    file_path: str,
+    supabase_url: str,
+    supabase_key: str,
+    bucket: str,
+) -> str:
     """
-    Upload a video file to Supabase Storage.
+    Upload a file to Supabase Storage and return its public URL.
+
+    The bucket must already exist and have public read access enabled
+    (Supabase dashboard → Storage → bucket → Make Public).
 
     Args:
-        local_path: Absolute path to the MP4 file on disk.
+        file_path:    Absolute path to the local file to upload.
+        supabase_url: Project URL, e.g. https://xxxx.supabase.co
+        supabase_key: service_role secret key (NOT the anon key —
+                      anon key lacks storage write permissions).
+        bucket:       Target bucket name, e.g. "faceswap-uploads".
 
     Returns:
-        Public URL string for the uploaded file.
+        Public HTTPS URL for the uploaded file.
+
+    Raises:
+        FileNotFoundError: if file_path does not exist.
+        StorageException:  if the upload is rejected by Supabase.
     """
-    from supabase import create_client, Client
+    from supabase import create_client
 
-    url = _require_env("SUPABASE_URL")
-    key = _require_env("SUPABASE_KEY")
-    bucket = os.environ.get("SUPABASE_BUCKET", "face-swap-results")
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File to upload not found: {file_path}")
 
-    client: Client = create_client(url, key)
+    client = create_client(supabase_url, supabase_key)
 
-    # Generate a unique object key
-    file_name = f"{uuid.uuid4()}.mp4"
-    object_path = f"outputs/{file_name}"
+    # Unique object key so concurrent jobs never collide
+    ext = os.path.splitext(file_path)[1] or ".mp4"
+    object_path = f"outputs/{uuid.uuid4()}{ext}"
 
-    with open(local_path, "rb") as f:
-        video_bytes = f.read()
+    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+    print(f"[storage] uploading {file_size_mb:.1f} MB → {bucket}/{object_path}")
 
-    print(f"[storage] uploading {len(video_bytes) / (1024*1024):.1f} MB → {bucket}/{object_path}")
-
-    client.storage.from_(bucket).upload(
-        path=object_path,
-        file=video_bytes,
-        file_options={"content-type": "video/mp4"},
-    )
+    with open(file_path, "rb") as f:
+        client.storage.from_(bucket).upload(
+            path=object_path,
+            file=f,
+            file_options={"content-type": _content_type(ext)},
+        )
 
     public_url = client.storage.from_(bucket).get_public_url(object_path)
     print(f"[storage] public URL: {public_url}")
     return public_url
 
 
+def upload_video(file_path: str) -> str:
+    """
+    Convenience wrapper that reads credentials from environment variables.
+    Called by main.py inside the Modal function where the Secret is injected.
+
+    Required env vars (set via Modal Secret 'supabase-secret'):
+      SUPABASE_URL    — https://xxxx.supabase.co
+      SUPABASE_KEY    — service_role key
+      SUPABASE_BUCKET — bucket name (default: faceswap-uploads)
+    """
+    url    = _require_env("SUPABASE_URL")
+    key    = _require_env("SUPABASE_KEY")
+    bucket = os.environ.get("SUPABASE_BUCKET", "faceswap-uploads")
+
+    return upload_to_supabase(file_path, url, key, bucket)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _content_type(ext: str) -> str:
+    return {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".webm": "video/webm",
+    }.get(ext.lower(), "application/octet-stream")
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
         raise EnvironmentError(
-            f"Missing required environment variable: {name}. "
-            f"Add it to the Modal Secret 'supabase-secret'."
+            f"Missing required env var: {name}. "
+            "Add it to the Modal Secret 'supabase-secret'."
         )
     return value
