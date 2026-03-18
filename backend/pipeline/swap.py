@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 import onnxruntime
 
-from pipeline.detect import get_frame_faces, _bbox_area
+from pipeline.detect import detect_face, FaceDetection
 
 
 def load_swapper(weights_dir: str):
@@ -35,17 +35,15 @@ def load_swapper(weights_dir: str):
 
 
 def swap_faces_in_frames(
-    analyser,
-    swapper,           # onnxruntime.InferenceSession
-    source_face,
-    frames_dir: str,
+    swapper,                    # onnxruntime.InferenceSession
+    identity_embedding: np.ndarray,  # (512,) from extract_identity()
+    frame_paths: list[str],     # sorted list from extract_frames()
     output_dir: str,
     swap_all_faces: bool = True,
 ):
     """
-    Iterate over every PNG in frames_dir, swap faces, write to output_dir.
+    Swap faces in a pre-extracted list of frame paths, write to output_dir.
     """
-    frame_paths = sorted(glob.glob(os.path.join(frames_dir, "*.png")))
     total = len(frame_paths)
     print(f"[swap] processing {total} frames...")
 
@@ -55,19 +53,19 @@ def swap_faces_in_frames(
             print(f"[swap] warning: could not read {frame_path}, skipping")
             continue
 
-        target_faces = get_frame_faces(analyser, frame)
+        target_faces = detect_face(frame)
 
-        if not target_faces:
+        if target_faces is None:
             out_path = os.path.join(output_dir, os.path.basename(frame_path))
             cv2.imwrite(out_path, frame)
             continue
 
-        if not swap_all_faces:
-            target_faces = [max(target_faces, key=lambda f: _bbox_area(f.bbox))]
+        # detect_face returns the single best face; wrap in list for loop below
+        faces_to_swap = [target_faces]
 
         result = frame.copy()
-        for target_face in target_faces:
-            result = _run_hyperswap(swapper, source_face, target_face, result)
+        for target_face in faces_to_swap:
+            result = _run_hyperswap(swapper, identity_embedding, target_face, result)
 
         out_path = os.path.join(output_dir, os.path.basename(frame_path))
         cv2.imwrite(out_path, result)
@@ -82,8 +80,8 @@ def swap_faces_in_frames(
 
 def _run_hyperswap(
     session: "onnxruntime.InferenceSession",
-    source_face,
-    target_face,
+    identity_embedding: np.ndarray,
+    target_face: "FaceDetection",
     frame: np.ndarray,
 ) -> np.ndarray:
     """
@@ -105,8 +103,8 @@ def _run_hyperswap(
     blob = (blob / 127.5) - 1.0
     blob = blob.transpose(2, 0, 1)[np.newaxis]  # (1,3,256,256)
 
-    # 3. Source embedding from InsightFace (normed 512-d)
-    src_emb = source_face.normed_embedding.reshape(1, -1).astype(np.float32)
+    # 3. Source embedding — pre-extracted once by extract_identity()
+    src_emb = identity_embedding.reshape(1, -1).astype(np.float32)
 
     # Build feed dict — order matches model's declared inputs
     feed = {}

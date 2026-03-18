@@ -1,77 +1,106 @@
 """
-extract.py — FFmpeg frame extraction
-Splits a video into PNG frames and pulls the audio track.
-Returns the video's FPS so rebuild.py can reassemble correctly.
+extract.py — Frame extraction + audio strip using ffmpeg-python
 """
 import os
-import subprocess
+import glob
+import ffmpeg
 
 
-def extract_frames(video_path: str, frames_dir: str, audio_path: str) -> float:
+def extract_frames(video_path: str, output_dir: str) -> tuple[list[str], str]:
     """
-    Extract every frame as a PNG and the audio as AAC.
+    Extract every frame from a video as PNG files and strip the audio track.
+
+    Handles videos up to 2 minutes / 1080p. Frames are named
+    frame_000001.png, frame_000002.png, … for stable sorted ordering.
 
     Args:
-        video_path:  Path to the input video file.
-        frames_dir:  Directory to write frame_0001.png, frame_0002.png, …
-        audio_path:  Where to write the extracted audio (AAC).
+        video_path: Absolute path to the input video file (MP4, MOV, etc.).
+        output_dir: Directory to write frames and audio into. Created if missing.
 
     Returns:
-        fps (float) — frame rate of the source video.
+        (frame_paths, audio_path) where:
+          - frame_paths is a sorted list of absolute paths to every PNG frame.
+          - audio_path  is the absolute path to audio.aac (may be an empty file
+            if the source video has no audio track — always safe to pass to
+            rebuild.py which handles the silent case).
     """
-    fps = _probe_fps(video_path)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # Extract frames
-    frame_pattern = os.path.join(frames_dir, "frame_%06d.png")
-    _run([
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vf", f"fps={fps}",
-        "-q:v", "1",          # lossless-ish PNG quality
-        frame_pattern,
-    ])
+    audio_path = os.path.join(output_dir, "audio.aac")
+    frame_pattern = os.path.join(output_dir, "frame_%06d.png")
 
-    # Extract audio (best-effort — silent videos are fine)
-    _run([
-        "ffmpeg", "-y",
-        "-i", video_path,
-        "-vn",
-        "-acodec", "aac",
-        "-b:a", "192k",
-        audio_path,
-    ], check=False)
-
-    n_frames = len([f for f in os.listdir(frames_dir) if f.endswith(".png")])
-    print(f"[extract] {n_frames} frames @ {fps} fps | audio: {os.path.exists(audio_path)}")
-    return fps
-
-
-def _probe_fps(video_path: str) -> float:
-    """Use ffprobe to read the exact frame rate."""
-    result = subprocess.run(
-        [
-            "ffprobe", "-v", "error",
-            "-select_streams", "v:0",
-            "-show_entries", "stream=r_frame_rate",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            video_path,
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
+    # ── Probe ──────────────────────────────────────────────────────────────────
+    probe = ffmpeg.probe(video_path)
+    video_stream = next(
+        (s for s in probe["streams"] if s["codec_type"] == "video"), None
     )
-    raw = result.stdout.strip()  # e.g. "30000/1001" or "30/1"
-    if "/" in raw:
-        num, den = raw.split("/")
-        return float(num) / float(den)
-    return float(raw)
+    audio_stream = next(
+        (s for s in probe["streams"] if s["codec_type"] == "audio"), None
+    )
 
+    if video_stream is None:
+        raise ValueError(f"No video stream found in: {video_path}")
 
-def _run(cmd: list, check: bool = True):
-    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-    if check and result.returncode != 0:
-        raise RuntimeError(
-            f"FFmpeg command failed (exit {result.returncode}):\n"
-            f"  cmd: {' '.join(cmd)}\n"
-            f"  stderr: {result.stderr[-2000:]}"
+    fps = _parse_fps(video_stream.get("r_frame_rate", "30/1"))
+    duration = float(probe["format"].get("duration", 0))
+    width = int(video_stream.get("width", 0))
+    height = int(video_stream.get("height", 0))
+
+    print(f"[extract] {width}x{height} @ {fps:.3f} fps | duration={duration:.1f}s")
+
+    # ── Frames ─────────────────────────────────────────────────────────────────
+    (
+        ffmpeg
+        .input(video_path)
+        .video
+        .filter("fps", fps=fps)           # lock to exact source fps
+        .filter("scale",                  # cap at 1080p, preserve AR
+                w="min(iw,1920)",
+                h="min(ih,1080)",
+                force_original_aspect_ratio="decrease")
+        .output(
+            frame_pattern,
+            vcodec="png",
+            vsync="vfr",                  # drop dupes without renumbering
+            **{"qscale:v": 1},            # near-lossless PNG compression
         )
+        .overwrite_output()
+        .run(quiet=True)
+    )
+
+    frame_paths = sorted(glob.glob(os.path.join(output_dir, "frame_*.png")))
+    print(f"[extract] extracted {len(frame_paths)} frames")
+
+    # ── Audio ──────────────────────────────────────────────────────────────────
+    if audio_stream:
+        (
+            ffmpeg
+            .input(video_path)
+            .audio
+            .output(
+                audio_path,
+                acodec="aac",
+                audio_bitrate="192k",
+                ac=2,                     # force stereo
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        print(f"[extract] audio stripped → {audio_path}")
+    else:
+        # Write an empty placeholder so callers don't need to guard for None
+        open(audio_path, "wb").close()
+        print("[extract] no audio track found — empty placeholder written")
+
+    return frame_paths, audio_path
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _parse_fps(r_frame_rate: str) -> float:
+    """Convert ffprobe r_frame_rate string (e.g. '30000/1001') to float."""
+    if "/" in r_frame_rate:
+        num, den = r_frame_rate.split("/")
+        den = int(den)
+        return float(num) / den if den else 30.0
+    return float(r_frame_rate)

@@ -145,11 +145,13 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
     import tempfile
 
     from pipeline.extract import extract_frames
-    from pipeline.detect import load_face_analyser, get_source_face
+    from pipeline.detect import detect_face, extract_identity
     from pipeline.swap import load_swapper, swap_faces_in_frames
     from pipeline.restore import restore_frames
     from pipeline.rebuild import rebuild_video
     from storage import upload_video
+
+    ARCFACE_PATH = os.path.join(WEIGHTS_DIR, "insightface", "models", "buffalo_l", "w600k_r50.onnx")
 
     with tempfile.TemporaryDirectory() as work_dir:
         # ── 1. Write inputs to disk ────────────────────────────────────────────
@@ -164,7 +166,6 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
         swapped_dir = os.path.join(work_dir, "swapped")
         restored_dir = os.path.join(work_dir, "restored")
         output_path = os.path.join(work_dir, "output.mp4")
-        audio_path = os.path.join(work_dir, "audio.aac")
 
         os.makedirs(frames_dir, exist_ok=True)
         os.makedirs(swapped_dir, exist_ok=True)
@@ -172,20 +173,19 @@ def swap_face(source_image: bytes, target_video: bytes) -> str:
 
         # ── 2. Extract frames + audio ──────────────────────────────────────────
         print("[pipeline] extracting frames...")
-        fps = extract_frames(tgt_vid_path, frames_dir, audio_path)
+        frame_paths, audio_path = extract_frames(tgt_vid_path, frames_dir)
 
-        # ── 3. Load models ─────────────────────────────────────────────────────
-        print("[pipeline] loading models...")
-        analyser = load_face_analyser(WEIGHTS_DIR)
+        # ── 3. Load swap model ─────────────────────────────────────────────────
+        print("[pipeline] loading HyperSwap model...")
         swapper = load_swapper(WEIGHTS_DIR)
 
-        # ── 4. Get source face embedding ───────────────────────────────────────
-        print("[pipeline] analysing source face...")
-        source_face = get_source_face(analyser, src_img_path)
+        # ── 4. Extract source identity embedding (once per job) ────────────────
+        print("[pipeline] extracting source identity...")
+        identity_embedding = extract_identity(src_img_path, ARCFACE_PATH)
 
         # ── 5. Swap faces in every frame ───────────────────────────────────────
         print("[pipeline] swapping faces...")
-        swap_faces_in_frames(analyser, swapper, source_face, frames_dir, swapped_dir)
+        swap_faces_in_frames(swapper, identity_embedding, frame_paths, swapped_dir)
 
         # ── 6. Restore / enhance frames ────────────────────────────────────────
         print("[pipeline] restoring frames with CodeFormer...")
