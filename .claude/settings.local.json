@@ -7,7 +7,27 @@
       "Bash(nvm use:*)",
       "Bash(where node:*)",
       "Bash(find:*)",
-      "Bash(curl:*)"
+      "Bash(curl:*)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(python -m pip install modal)",
+      "Read(//c/Users/aidaw/AppData/Local/Programs/Python//**)",
+      "Bash(ls /c/Python*)",
+      "Bash(where python:*)",
+      "Bash(/c/Users/aidaw/AppData/Local/Programs/Python/Python312/python.exe --version)",
+      "Bash(\"/c/Users/aidaw/AppData/Local/Programs/Python/Python312/Scripts/pip.exe\" install:*)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(\"/c/Users/aidaw/AppData/Local/Programs/Python/Python312/Scripts/pip3.exe\" install:*)",
+      "Bash(\"/c/Users/aidaw/myenv/Scripts/python.exe\" --version)",
+      "Bash(\"/c/Users/aidaw/myenv/Scripts/pip.exe\" show:*)",
+      "Bash(\"/c/Users/aidaw/Desktop/Code/ThumbnailGenerator/.venv/Scripts/python.exe\" --version)",
+      "Bash(\"/c/Users/aidaw/Desktop/Code/ThumbnailGenerator/.venv/Scripts/pip.exe\" show:*)",
+      "Bash(\"/c/Users/aidaw/AppData/Local/Programs/Python/Launcher/py.exe\" --version)",
+      "Bash(\"/c/Users/aidaw/AppData/Local/Programs/Python/Launcher/py.exe\" -3.12 --version)",
+      "Bash(python -m modal secret create supabase-secret SUPABASE_URL=https://kojjfyryfwlqulhkuxro.supabase.co SUPABASE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtvampmeXJ5ZndscXVsaGt1eHJvIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3MzY5MTA0MywiZXhwIjoyMDg5MjY3MDQzfQ.mqAvLhuNl8hxCn_Bz4Du7YDTI3-UD6SO02GAxsyhpU8 SUPABASE_BUCKET=faceswap-uploads)",
+      "Bash(python -m modal secret create api-secret \"API_TOKEN=key_69cefa816fba63fa95a1cb0726114604ba4abf7bbed638129e6cb6b1787040361d8bacd3cf97840932757312169581d846bed7e2b94955ffa6a0a3d8d63227f7\")",
+      "Bash(python:*)",
+      "Bash(set PYTHONIOENCODING=utf-8)"
     ]
   }
 }
