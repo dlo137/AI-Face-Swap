@@ -237,7 +237,10 @@ def _bbox_area(bbox):
 
 # ── Swap ───────────────────────────────────────────────────────────────────────
 
-_FACE_LABELS   = {1, 2, 3, 4, 5, 10, 11, 12, 13}
+# BiSeNet CelebAMask-HQ labels included in the swap mask.
+# 1=skin 2=l_brow 3=r_brow 4=l_eye 5=r_eye 10=nose
+# 12=u_lip 13=i_mouth 14=l_lip 16=chin 17=neck
+_FACE_LABELS   = {1, 2, 3, 4, 5, 10, 12, 13, 14, 16, 17}
 _BISENET_MEAN  = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _BISENET_STD   = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
@@ -265,12 +268,27 @@ def swap_frame(frame, identity_embedding, hyperswap_model, bisenet_model):
         return frame
     aligned, M = _align_to_M(frame, face.landmarks, 256)
     swapped_crop = _run_hyperswap(hyperswap_model, identity_embedding, aligned)
+
+    # Landmark correction: HyperSwap output can drift slightly from the
+    # canonical 256-px grid, causing the mouth to double-expose.
+    # Detect landmarks in the swapped crop and re-align to the canonical
+    # template so M_inv lands it precisely on the target face.
+    swap_face = detect_face(swapped_crop)
+    if swap_face is not None:
+        tpl = (_ARCFACE_TPL_112 * (256.0 / 112.0)).astype(np.float32)
+        M_corr, _ = cv2.estimateAffinePartial2D(
+            swap_face.landmarks, tpl, method=cv2.LMEDS)
+        if M_corr is not None:
+            swapped_crop = cv2.warpAffine(
+                swapped_crop, M_corr, (256, 256), flags=cv2.INTER_LINEAR)
+
     mask_256 = (_bisenet_face_mask(bisenet_model, aligned)
                 if bisenet_model is not None else _ellipse_mask(256))
     h, w = frame.shape[:2]
     M_inv = cv2.invertAffineTransform(M)
     swapped_full = cv2.warpAffine(swapped_crop, M_inv, (w, h), flags=cv2.INTER_LINEAR)
     mask_full    = cv2.warpAffine(mask_256,     M_inv, (w, h), flags=cv2.INTER_LINEAR)
+    mask_full    = cv2.GaussianBlur(mask_full, (21, 21), 0).clip(0., 1.)
     alpha = mask_full[:, :, np.newaxis].astype(np.float32)
     return (swapped_full.astype(np.float32) * alpha +
             frame.astype(np.float32) * (1. - alpha)).clip(0, 255).astype(np.uint8)
@@ -287,17 +305,41 @@ def _run_hyperswap(session, identity_embedding, aligned_256):
     result = (out[0].transpose(1, 2, 0) + 1.0) * 127.5
     return cv2.cvtColor(result.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
+def _bisenet_run(session, img_512):
+    """Run BiSeNet on a 512-px BGR crop; return label map and unique label set."""
+    rgb    = cv2.cvtColor(img_512, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+    blob   = ((rgb - _BISENET_MEAN) / _BISENET_STD).transpose(2, 0, 1)[np.newaxis]
+    logits = session.run(None, {session.get_inputs()[0].name: blob})[0]
+    labels = logits[0].argmax(axis=0)
+    return labels, set(np.unique(labels).tolist())
+
+
+def _extend_mask_down(mask, frac=0.20):
+    """Extend the bottom edge of the mask bbox downward by frac of its height."""
+    rows = np.where(mask > 0.5)
+    if len(rows[0]) == 0:
+        return mask
+    y_min, y_max = int(rows[0].min()), int(rows[0].max())
+    x_min, x_max = int(rows[1].min()), int(rows[1].max())
+    ext      = int((y_max - y_min) * frac)
+    y_bottom = min(mask.shape[0], y_max + ext)
+    extended = mask.copy()
+    extended[y_max:y_bottom, x_min:x_max] = 1.0
+    return extended
+
+
 def _bisenet_face_mask(session, face_crop_256):
     import cv2
     resized = cv2.resize(face_crop_256, (512, 512), interpolation=cv2.INTER_LINEAR)
-    rgb  = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    blob = ((rgb - _BISENET_MEAN) / _BISENET_STD).transpose(2, 0, 1)[np.newaxis]
-    logits = session.run(None, {session.get_inputs()[0].name: blob})[0]
-    labels = logits[0].argmax(axis=0)
-    mask   = np.zeros_like(labels, dtype=np.float32)
+    labels, unique = _bisenet_run(session, resized)
+    print(f"[bisenet] labels detected: {sorted(unique)}")
+    mask = np.zeros_like(labels, dtype=np.float32)
     for lbl in _FACE_LABELS:
         mask[labels == lbl] = 1.0
-    mask = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_LINEAR)
+    mask  = _extend_mask_down(mask, frac=0.20)
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask  = cv2.dilate(mask, dil_k, iterations=3)
+    mask  = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_LINEAR)
     return cv2.GaussianBlur(mask, (15, 15), 7).clip(0., 1.)
 
 def _ellipse_mask(size: int):
@@ -316,7 +358,7 @@ def _log_io(session, name):
 # ── Restore ────────────────────────────────────────────────────────────────────
 
 CODEFORMER_DIR      = "/opt/CodeFormer"
-CODEFORMER_FIDELITY = 0.6
+CODEFORMER_FIDELITY = 0.15
 
 def load_codeformer(weights_dir: str):
     import sys, importlib, torch
@@ -336,6 +378,13 @@ def load_codeformer(weights_dir: str):
     print(f"[restore] CodeFormer loaded (device={device})")
     return net
 
+def _sharpen_face(face_crop: np.ndarray) -> np.ndarray:
+    """Unsharp-style sharpening applied to the face crop only."""
+    import cv2
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+    return cv2.filter2D(face_crop, -1, kernel)
+
+
 def restore_frame(swapped_frame, original_frame, bisenet_model=None, codeformer_net=None):
     import cv2
     face = detect_face(swapped_frame)
@@ -344,6 +393,7 @@ def restore_frame(swapped_frame, original_frame, bisenet_model=None, codeformer_
     colour_corrected = _match_lighting(swapped_frame, original_frame, face)
     aligned_512, M   = _align_to_M(colour_corrected, face.landmarks, 512)
     restored_512     = _run_codeformer(codeformer_net, aligned_512) if codeformer_net else aligned_512
+    restored_512     = _sharpen_face(restored_512)
     mask_512 = (_bisenet_mask_512(bisenet_model, aligned_512)
                 if bisenet_model is not None else _ellipse_mask_r(512))
     return _paste_back(swapped_frame, restored_512, mask_512, M)
@@ -377,13 +427,14 @@ def _run_codeformer(net, face_512):
 
 def _bisenet_mask_512(session, face_512):
     import cv2
-    rgb  = cv2.cvtColor(face_512, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    blob = ((rgb - _BISENET_MEAN) / _BISENET_STD).transpose(2, 0, 1)[np.newaxis]
-    logits = session.run(None, {session.get_inputs()[0].name: blob})[0]
-    labels = logits[0].argmax(axis=0)
-    mask   = np.zeros_like(labels, dtype=np.float32)
+    labels, unique = _bisenet_run(session, face_512)
+    print(f"[bisenet512] labels detected: {sorted(unique)}")
+    mask = np.zeros_like(labels, dtype=np.float32)
     for lbl in _FACE_LABELS:
         mask[labels == lbl] = 1.0
+    mask  = _extend_mask_down(mask, frac=0.20)
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask  = cv2.dilate(mask, dil_k, iterations=3)
     return cv2.GaussianBlur(mask, (31, 31), 11).clip(0., 1.)
 
 def _ellipse_mask_r(size: int):
@@ -401,9 +452,50 @@ def _paste_back(frame, restored_512, mask_512, M):
     M_inv = cv2.invertAffineTransform(M)
     rf    = cv2.warpAffine(restored_512, M_inv, (w, h), flags=cv2.INTER_LINEAR)
     mf    = cv2.warpAffine(mask_512,     M_inv, (w, h), flags=cv2.INTER_LINEAR)
+    mf    = cv2.GaussianBlur(mf, (21, 21), 0).clip(0., 1.)
     alpha = mf[:, :, np.newaxis].astype(np.float32)
     return (rf.astype(np.float32) * alpha +
             frame.astype(np.float32) * (1. - alpha)).clip(0, 255).astype(np.uint8)
+
+
+# ── Temporal smoothing ─────────────────────────────────────────────────────────
+
+def _temporal_smooth(frame_dir: str) -> None:
+    """Blend each frame's face bbox with its neighbours to reduce flicker.
+
+    smoothed_roi = 0.8 * current + 0.1 * prev + 0.1 * next
+    Applied only inside the detected face bounding box.
+    """
+    import cv2, glob
+    paths = sorted(glob.glob(os.path.join(frame_dir, "frame_*.png")))
+    n = len(paths)
+    if n < 3:
+        return
+    print(f"[smooth] temporal smoothing {n} frames...")
+    for i, path in enumerate(paths):
+        curr = cv2.imread(path)
+        if curr is None:
+            continue
+        face = detect_face(curr)
+        if face is None:
+            continue
+        x1, y1, x2, y2 = face.bbox.astype(int)
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(curr.shape[1], x2), min(curr.shape[0], y2)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        prev = cv2.imread(paths[max(0, i - 1)])
+        nxt  = cv2.imread(paths[min(n - 1, i + 1)])
+        if prev is None or nxt is None:
+            continue
+        roi = (
+            0.8 * curr[y1:y2, x1:x2].astype(np.float32) +
+            0.1 * prev[y1:y2, x1:x2].astype(np.float32) +
+            0.1 * nxt [y1:y2, x1:x2].astype(np.float32)
+        ).clip(0, 255).astype(np.uint8)
+        curr[y1:y2, x1:x2] = roi
+        cv2.imwrite(path, curr)
+    print("[smooth] done")
 
 
 # ── Rebuild ────────────────────────────────────────────────────────────────────
@@ -519,6 +611,10 @@ def run_face_swap(source_image_bytes: bytes, target_video_bytes: bytes,
             if (i + 1) % 50 == 0 or (i + 1) == total:
                 print(f"[{_e()}] frames {i+1}/{total} ({skipped} skipped)")
         print(f"[{_e()}] step 5/7 complete")
+
+        print(f"[{_e()}] step 5b/7 — temporal smoothing...")
+        _temporal_smooth(output_dir)
+        print(f"[{_e()}] temporal smoothing complete")
 
         print(f"[{_e()}] step 6/7 — rebuilding video...")
         rebuild_video(output_dir, audio_path, output_path)
