@@ -19,10 +19,13 @@ image = (
         "torchaudio==2.2.1",
         index_url="https://download.pytorch.org/whl/cu121",
     )
+    .run_commands(
+        "pip install onnxruntime-gpu==1.18.0 "
+        "--extra-index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
+    )
     .pip_install(
         "numpy<2",
         "insightface==0.7.3",
-        "onnxruntime-gpu==1.17.1",
         "opencv-python-headless==4.9.0.80",
         "ffmpeg-python==0.2.0",
         "Pillow",
@@ -33,6 +36,7 @@ image = (
         "supabase",
         "fastapi",
         "python-multipart",
+        "gdown",
     )
     .run_commands(
         "git clone https://github.com/sczhou/CodeFormer.git /opt/CodeFormer",
@@ -83,6 +87,16 @@ def download_weights():
           f"{WEIGHTS_DIR}/codeformer/detection_Resnet50_Final.pth")
     fetch("https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth",
           f"{WEIGHTS_DIR}/codeformer/parsing_parsenet.pth")
+
+    bisenet_dest = f"{WEIGHTS_DIR}/bisenet/bisenet.pth"
+    if not os.path.exists(bisenet_dest):
+        import gdown
+        os.makedirs(os.path.dirname(bisenet_dest), exist_ok=True)
+        print(f"[weights] downloading BiSeNet → {bisenet_dest}")
+        gdown.download(id="154JgKpzCPW82qINcVieuPH3fZ2e0P812", output=bisenet_dest, quiet=False)
+        print(f"[weights] BiSeNet done: {bisenet_dest}")
+    else:
+        print(f"[weights] exists: {bisenet_dest}")
 
     weights_volume.commit()
     print("[weights] all done.")
@@ -245,18 +259,25 @@ _BISENET_MEAN  = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _BISENET_STD   = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
 def load_models(weights_dir: str):
-    import onnxruntime
+    import onnxruntime, torch
     providers      = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     hyperswap_path = os.path.join(weights_dir, "hyperswap", "hyperswap_1a_256.onnx")
-    bisenet_path   = os.path.join(weights_dir, "bisenet",   "bisenet_resnet_34.onnx")
     if not os.path.exists(hyperswap_path):
         raise FileNotFoundError(f"HyperSwap model not found: {hyperswap_path}")
     hyperswap = onnxruntime.InferenceSession(hyperswap_path, providers=providers)
     _log_io(hyperswap, "hyperswap")
+
     bisenet = None
+    bisenet_path = os.path.join(weights_dir, "bisenet", "bisenet.pth")
     if os.path.exists(bisenet_path):
-        bisenet = onnxruntime.InferenceSession(bisenet_path, providers=providers)
-        _log_io(bisenet, "bisenet")
+        from facexlib.parsing import BiSeNet
+        net = BiSeNet(num_class=19).to(device)
+        net.load_state_dict(torch.load(bisenet_path, map_location=device))
+        net.eval()
+        bisenet = net
+        print(f"[swap] BiSeNet loaded (device={device})")
     else:
         print("[swap] BiSeNet not found — using ellipse mask fallback")
     return hyperswap, bisenet
@@ -305,17 +326,23 @@ def _run_hyperswap(session, identity_embedding, aligned_256):
     result = (out[0].transpose(1, 2, 0) + 1.0) * 127.5
     return cv2.cvtColor(result.clip(0, 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
 
-def _bisenet_run(session, img_512):
-    """Run BiSeNet on a 512-px BGR crop; return label map and unique label set."""
+def _bisenet_run(bisenet_model, img_512):
+    """Run BiSeNet (PyTorch) on a 512-px BGR crop; return label map and unique label set."""
+    import cv2, torch
     rgb    = cv2.cvtColor(img_512, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-    blob   = ((rgb - _BISENET_MEAN) / _BISENET_STD).transpose(2, 0, 1)[np.newaxis]
-    logits = session.run(None, {session.get_inputs()[0].name: blob})[0]
-    labels = logits[0].argmax(axis=0)
+    blob   = ((rgb - _BISENET_MEAN) / _BISENET_STD).transpose(2, 0, 1)
+    tensor = torch.from_numpy(blob).unsqueeze(0)
+    device = next(bisenet_model.parameters()).device
+    with torch.no_grad():
+        out = bisenet_model(tensor.to(device))[0]   # returns (out, feat1, feat2)
+    labels = out.squeeze(0).argmax(0).cpu().numpy()
     return labels, set(np.unique(labels).tolist())
 
 
-def _extend_mask_down(mask, frac=0.20):
-    """Extend the bottom edge of the mask bbox downward by frac of its height."""
+def _extend_mask_down(mask, frac=0.25, bottom_fade_px=40):
+    """Extend the bottom edge of the mask bbox downward by frac of its height,
+    then apply a linear gradient falloff over the last bottom_fade_px rows so
+    the neck blends smoothly into the chest/shirt region."""
     rows = np.where(mask > 0.5)
     if len(rows[0]) == 0:
         return mask
@@ -325,6 +352,14 @@ def _extend_mask_down(mask, frac=0.20):
     y_bottom = min(mask.shape[0], y_max + ext)
     extended = mask.copy()
     extended[y_max:y_bottom, x_min:x_max] = 1.0
+    # Gradient falloff over the bottom fade_px rows
+    fade_start = max(y_max, y_bottom - bottom_fade_px)
+    fade_rows  = y_bottom - fade_start
+    if fade_rows > 0:
+        for i in range(fade_rows):
+            alpha = 1.0 - (i + 1) / fade_rows   # 1.0 → ~0.0
+            row   = fade_start + i
+            extended[row, x_min:x_max] = np.minimum(extended[row, x_min:x_max], alpha)
     return extended
 
 
@@ -336,9 +371,9 @@ def _bisenet_face_mask(session, face_crop_256):
     mask = np.zeros_like(labels, dtype=np.float32)
     for lbl in _FACE_LABELS:
         mask[labels == lbl] = 1.0
-    mask  = _extend_mask_down(mask, frac=0.20)
-    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    mask  = cv2.dilate(mask, dil_k, iterations=3)
+    mask  = _extend_mask_down(mask, frac=0.25, bottom_fade_px=40)
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    mask  = cv2.dilate(mask, dil_k, iterations=2)
     mask  = cv2.resize(mask, (256, 256), interpolation=cv2.INTER_LINEAR)
     return cv2.GaussianBlur(mask, (15, 15), 7).clip(0., 1.)
 
@@ -432,9 +467,9 @@ def _bisenet_mask_512(session, face_512):
     mask = np.zeros_like(labels, dtype=np.float32)
     for lbl in _FACE_LABELS:
         mask[labels == lbl] = 1.0
-    mask  = _extend_mask_down(mask, frac=0.20)
-    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
-    mask  = cv2.dilate(mask, dil_k, iterations=3)
+    mask  = _extend_mask_down(mask, frac=0.25, bottom_fade_px=40)
+    dil_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+    mask  = cv2.dilate(mask, dil_k, iterations=2)
     return cv2.GaussianBlur(mask, (31, 31), 11).clip(0., 1.)
 
 def _ellipse_mask_r(size: int):
